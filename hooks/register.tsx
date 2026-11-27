@@ -34,6 +34,8 @@ type Fiche = Role & { text: string; mtimeMs: number }
 const BEAT_MS = 5000
 const TERM_MS = 30000
 const STALE_MS = 30000
+// Un /rename lancé attend la fin du tour en cours : on ne le relance qu'après ce délai.
+const RENAME_MS = 60000
 const CHUNK = 4 * 1024 * 1024
 const TITLE = /"customTitle":("(?:[^"\\]|\\.)*")/g
 const CARD = 'session'
@@ -53,7 +55,7 @@ const S: {
   sid: string; home: string; base: string; cwd: string; profile: string; transcript: string
   name?: string; role?: string; group?: string; dirGroup?: string; rolesDir: string; fiche: Fiche | null
   term?: Place; termAt: number; busy: boolean; pendingName?: string; creating?: string; isOneShot?: boolean
-  askingSince?: number; doneAt?: number
+  askingSince?: number; doneAt?: number; renameAt?: number
 } = { sid: '', home: '', base: '', cwd: '', profile: '', transcript: '', rolesDir: '', fiche: null, termAt: 0, busy: false }
 
 function key(name: string) {
@@ -229,6 +231,7 @@ async function refreshFiche($: any) {
 async function setRole($: any, role: string) {
   S.role = role
   S.pendingName = role
+  S.renameAt = undefined
   S.fiche = await readFiche($, role)
   await writeEntry($)
   await showStatus($)
@@ -484,6 +487,7 @@ async function setName($: any, name: string) {
   const clean = name.trim()
   if (!clean || clean === S.name) return
   S.pendingName = clean
+  S.renameAt = undefined
   S.name = clean
   await writeEntry($)
 }
@@ -510,9 +514,15 @@ async function tick($: any) {
     S.sid = sid
     S.transcript = (await $.session.info()).transcriptPath ?? ''
   }
-  if (S.pendingName) {
+  // /rename en plein tour se met en file d'attente : on le lance session libre,
+  // une fois, et on ne le relance que s'il n'a toujours rien donné après RENAME_MS.
+  if (S.pendingName && (await lastTitle($, S.transcript, CHUNK)) === S.pendingName) {
+    S.pendingName = undefined
+    S.renameAt = undefined
+  }
+  if (S.pendingName && !S.busy && (!S.renameAt || now - S.renameAt > RENAME_MS)) {
+    S.renameAt = now
     await $.command.run({ command: 'rename', args: S.pendingName }).catch((err: any) => $.ui.toast(`session : /rename refusé (${String(err)})`))
-    if ((await lastTitle($, S.transcript, CHUNK)) === S.pendingName) S.pendingName = undefined
   }
   if (now - S.termAt > TERM_MS) {
     S.term = await where($).catch(() => S.term)
