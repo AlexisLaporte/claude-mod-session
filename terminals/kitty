@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Adaptateur de terminal du mod « session », pour kitty.
+
+Le mod n'appelle que ce script : il ne connaît pas kitty. Le contrat, commun à
+tout adaptateur (variable SESSION_TERMINAL pour en donner un autre) :
+
+  where   Lancé depuis la session (son environnement). Écrit en JSON
+          {"place": …, "window": "…", "order": n} : « place » est opaque et
+          revient tel quel dans focus/close/open ; « window » identifie la
+          fenêtre (même fenêtre = même groupe) ; « order » range les onglets.
+          N'écrit rien si la session ne tourne pas dans ce terminal.
+  focus   Lit un « place » sur l'entrée : met son onglet au premier plan.
+  close   Lit un « place » sur l'entrée : ferme son onglet.
+  open    Lit {"near": place|null, "title": str|null, "tabs": [{"cwd", "command"}]} :
+          ouvre un onglet par entrée, dans la fenêtre de « near » s'il est
+          donné, sinon dans une nouvelle fenêtre (nommée « title »).
+
+Code de sortie non nul + message sur stderr en cas d'échec.
+kitty doit avoir allow_remote_control et listen_on.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+
+def kitty(listen, *args, timeout=5):
+    out = subprocess.run(["kitty", "@", "--to", listen, *args], capture_output=True, text=True, timeout=timeout)
+    if out.returncode != 0:
+        sys.exit(out.stderr.strip() or f"kitty @ {args[0]} a échoué")
+    return out.stdout
+
+
+def started(pid):
+    """Heure de démarrage du processus kitty : un pid repris après redémarrage n'est pas la même fenêtre."""
+    try:
+        stat = open(f"/proc/{pid}/stat").read()
+        return stat[stat.rindex(")") + 2:].split(" ")[19]
+    except (OSError, ValueError, IndexError):
+        return ""
+
+
+def where():
+    listen, win = os.environ.get("KITTY_LISTEN_ON"), os.environ.get("KITTY_WINDOW_ID")
+    if not listen or not win:
+        return
+    win = int(win)
+    for os_window in json.loads(kitty(listen, "ls")):
+        for index, tab in enumerate(os_window["tabs"]):
+            if any(one["id"] == win for one in tab["windows"]):
+                start = started(os.environ.get("KITTY_PID", ""))
+                place = {"listen": listen, "win": win, "os": os_window["id"], "tabIndex": index, "started": start}
+                print(json.dumps({"place": place, "window": f"{listen}#{start}#{os_window['id']}", "order": index}))
+                return
+
+
+def tab_command(tab):
+    return ["bash", "-lic", f"{tab['command']}; exec bash"]
+
+
+def open_tabs(request):
+    near, tabs = request.get("near"), request["tabs"]
+    if near:
+        for tab in tabs:
+            kitty(near["listen"], "launch", "--type=tab", "--match", f"id:{near['win']}", "--cwd", tab["cwd"], *tab_command(tab))
+        return
+    state = os.path.expanduser("~/.local/state/claude-pool")
+    os.makedirs(state, exist_ok=True)
+    now = int(time.time() * 1000)
+    session = os.path.join(state, f"open-{now}.kitty")
+    with open(session, "w") as out:
+        for tab in tabs:
+            out.write(f"new_tab\ncd {tab['cwd']}\nlaunch {shlex.join(tab_command(tab))}\n")
+    title = re.sub(r"[^A-Za-z0-9]+", "-", request.get("title") or "seule")
+    # systemd-run : la fenêtre ne meurt pas avec la session qui l'ouvre.
+    out = subprocess.run(["systemd-run", "--user", "--collect", "--unit", f"kitty-session-{title}-{now}", "--",
+                          "kitty", "--session", session], capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(out.stderr.strip())
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    if command == "where":
+        where()
+    elif command == "focus":
+        place = json.load(sys.stdin)
+        kitty(place["listen"], "focus-window", "--match", f"id:{place['win']}")
+    elif command == "close":
+        place = json.load(sys.stdin)
+        kitty(place["listen"], "close-window", "--match", f"id:{place['win']}")
+    elif command == "open":
+        open_tabs(json.load(sys.stdin))
+    else:
+        sys.exit(f"usage : {sys.argv[0]} where | focus | close | open (JSON sur l'entrée)")
+
+
+if __name__ == "__main__":
+    main()

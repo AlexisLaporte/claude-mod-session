@@ -1,0 +1,5 @@
+{
+  "name": "claude-mod-session",
+  "owner": { "name": "Alexis Laporte" },
+  "plugins": [{ "name": "session", "source": "./" }]
+}

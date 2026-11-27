@@ -1,0 +1,9 @@
+{
+  "name": "session",
+  "version": "0.4.0",
+  "description": "Each Claude Code session gets a name, a role (its role card, .claude/roles/<role>.md) and a group (its kitty window): /moi to see and edit them, /sessions to find, focus or reopen any session",
+  "license": "MIT",
+  "author": { "name": "Alexis Laporte" },
+  "repository": "https://github.com/AlexisLaporte/claude-mod-session",
+  "types": "./types/index.d.ts"
+}
