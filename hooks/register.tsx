@@ -55,7 +55,7 @@ const S: {
   sid: string; home: string; base: string; cwd: string; profile: string; transcript: string
   name?: string; role?: string; group?: string; dirGroup?: string; rolesDir: string; fiche: Fiche | null
   term?: Place; termAt: number; busy: boolean; pendingName?: string; creating?: string; isOneShot?: boolean
-  askingSince?: number; doneAt?: number; renameAt?: number
+  askingSince?: number; doneAt?: number; renameAt?: number; isMailTurn?: boolean
 } = { sid: '', home: '', base: '', cwd: '', profile: '', transcript: '', rolesDir: '', fiche: null, termAt: 0, busy: false }
 
 function key(name: string) {
@@ -238,6 +238,19 @@ async function setRole($: any, role: string) {
   $.ui.invalidate('prompt.context')
 }
 
+// Les fiches à imiter pour en écrire une nouvelle : deux du même groupe, sinon
+// deux du même poste (le dernier mot du nom : « cto », « coo »…).
+function examplesFor(all: Role[], name: string, group: string | undefined): Role[] {
+  const same = group ? all.filter(one => one.group === group) : []
+  if (same.length) return same.slice(0, 2)
+  const post = key(name.trim().split(/\s+/).at(-1) ?? '')
+  return all.filter(one => key(one.name.split(/\s+/).at(-1) ?? '') === post && key(one.name) !== key(name)).slice(0, 2)
+}
+
+function examplesText(list: Role[]) {
+  return list.length ? ` et en imitant la forme de ${list.map(one => one.path).join(' et ')}` : ''
+}
+
 // Fait rédiger la fiche par la session, avec la personne, d'après le gabarit du
 // dossier : dans le sous-dossier du groupe de la session s'il en a un.
 async function createRole($: any, name: string) {
@@ -248,7 +261,7 @@ async function createRole($: any, name: string) {
   const template = (await $.fs.exists(`${dir}/_MODELE.md`)) ? `${dir}/_MODELE.md` : `${root}/_MODELE.md`
   const model = (await $.fs.exists(template)) ? `le gabarit ${template}` : 'un gabarit court (rôle en une phrase, périmètre, hors périmètre, superviseur, gestes qui demandent mon accord direct)'
   await $.prompt.submit({
-    text: `Rédige avec moi la fiche de rôle « ${name} » de cette session, d'après ${model} et une ou deux fiches voisines de ${dir} s'il y en a. ` +
+    text: `Rédige avec moi la fiche de rôle « ${name} » de cette session, d'après ${model}${examplesText(examplesFor(await roles($), name, group))}. ` +
       `Pose-moi d'abord tes questions (rôle, périmètre, hors périmètre, superviseur, accords), puis montre-moi le texte. ` +
       `Après mon accord seulement, écris-le dans « ${dir}/${name}.md » : le mod session donne alors ce rôle à la session tout seul.`,
   })
@@ -365,6 +378,33 @@ async function waitingList($: any): Promise<Entry[]> {
 // dès qu'elle est ouverte et libre (quelques secondes si elle tourne déjà).
 
 const WRITE_TOOL = 'ecrire'
+// Le début du tour qui remet le courrier : un tour ouvert par lui n'attend personne en finissant.
+const MAIL_HEAD = /^Messages? reçus? d'autres sessions/
+const ROLE_TOOL = 'role'
+
+// La session prend un rôle elle-même. Le premier se prend sans question ; en
+// changer demande l'accord de la personne. Sans fiche, l'outil dit où l'écrire.
+async function takeRole($: any, asked: string): Promise<string> {
+  const name = asked.trim()
+  const all = await roles($)
+  if (!name) {
+    return `${S.fiche ? `Rôle en place : ${roleLabel(S.fiche)}.` : 'Pas de rôle.'}\n\n${await rolesText($)}`
+  }
+  const role = await findRole($, name)
+  if (!role) {
+    const root = S.rolesDir || `${await $.session.root()}/.claude/roles`
+    const group = focusGroup(all) ?? S.dirGroup ?? S.group
+    const dir = group ? `${root}/${group}` : root
+    throw new Error(`Pas de fiche « ${name} ». Rédige-la avec la personne d'après ${root}/_MODELE.md${examplesText(examplesFor(all, name, group))}, sans ajouter de rubrique au gabarit, ` +
+      `écris-la dans « ${dir}/${name}.md » après son accord, puis rappelle cet outil.`)
+  }
+  if (S.fiche && S.fiche.path === role.path) return `Rôle « ${role.name} » déjà en place.`
+  if (S.fiche) {
+    const answer = await $.ui.ask(`La session demande à quitter le rôle « ${S.fiche.name} » pour « ${role.name} ».`, { options: ['Changer de rôle', 'Garder le rôle'], header: 'Rôle' }).catch(() => 'Garder le rôle')
+    if (answer !== 'Changer de rôle') throw new Error(`La personne garde le rôle « ${S.fiche.name} ».`)
+  }
+  return chooseRole($, role.name)
+}
 
 function inboxDir(sid: string) {
   return `${S.base}/inbox/${sid}`
@@ -462,9 +502,16 @@ async function loadIdentity($: any) {
   S.role = S.role ?? (await findRole($, S.name))?.name
 }
 
-// La fenêtre nommée l'emporte ; une session d'un groupe dans une fenêtre sans
-// nom (rouverte) lui donne le nom de son groupe.
+// Le groupe fixé par le dossier l'emporte ; sinon la fenêtre nommée ; une
+// session d'un groupe dans une fenêtre sans nom (rouverte) lui donne son groupe.
 async function syncGroup($: any) {
+  if (S.dirGroup) {
+    // Le dossier fixe le groupe : il l'emporte sur la fenêtre ; une fenêtre
+    // sans groupe le prend.
+    S.group = S.dirGroup
+    if (S.term && !S.isOneShot && !(await readJson($, claimPath(S.term)))) await $.fs.write(claimPath(S.term), JSON.stringify({ group: S.group }))
+    return
+  }
   if (!S.term || S.isOneShot) return
   const claim = await readJson($, claimPath(S.term))
   if (claim && 'group' in claim) S.group = claim.group ?? undefined
@@ -473,10 +520,13 @@ async function syncGroup($: any) {
 
 // Un nom de groupe, ou undefined : la fenêtre (toutes ses sessions) n'a plus de groupe.
 async function setGroup($: any, group: string | undefined) {
-  S.group = group
+  S.group = S.dirGroup ?? group
   if (S.term) await $.fs.write(claimPath(S.term), JSON.stringify({ group: group ?? null }))
   await writeEntry($)
   await showStatus($)
+  if (S.dirGroup && group !== S.dirGroup) {
+    return `${S.term ? `Fenêtre mise dans ${group ? `« ${group} »` : 'aucun groupe'}` : 'Rien de changé'} ; cette session reste dans « ${S.dirGroup} », fixé par son dossier (${DIR_CONFIG}).`
+  }
   if (!group) return S.term ? 'Plus de groupe pour les sessions de cette fenêtre.' : 'Plus de groupe pour cette session.'
   return S.term
     ? `Groupe « ${group} » : les sessions de cette fenêtre le rejoignent dans les 5 s, un onglet ouvert ensuite aussi.`
@@ -492,19 +542,41 @@ async function setName($: any, name: string) {
   await writeEntry($)
 }
 
+// Ce que la ligne d'état montre ; recalculé à chaque battement, redessiné s'il change.
+type Status = { role?: string; warn?: string; group?: string; asking: number; done: number }
+let status: Status = { asking: 0, done: 0 }
+
 async function showStatus($: any) {
-  const parts: string[] = []
-  if (S.rolesDir) {
-    if (!S.fiche) parts.push(S.role ? `⚠ rôle « ${S.role} » : fiche introuvable` : '⚠ pas de rôle : /role')
-    else {
-      const twin = await twinOf($, S.fiche.name)
-      parts.push(twin ? `⚠ rôle « ${S.fiche.name} » tenu aussi par « ${who(twin)} »` : `rôle : ${S.fiche.name}`)
-    }
-  }
-  if (S.group) parts.push(`groupe : ${S.group}`)
   const others = (await waitingList($)).filter(one => one.sid !== S.sid)
-  if (others.length) parts.push(`⏳ ${others.length} t'attend${others.length > 1 ? 'ent' : ''} : /sessions`)
-  $.ui.status(parts.length ? parts.join(' · ') : undefined)
+  const asking = others.filter(one => one.waiting === 'question').length
+  const next: Status = { group: S.group, asking, done: others.length - asking }
+  if (S.fiche) {
+    next.role = S.fiche.name
+    const twin = await twinOf($, S.fiche.name)
+    if (twin) next.warn = `aussi tenu par « ${who(twin)} »`
+  } else if (S.role) next.warn = `rôle « ${S.role} » : fiche introuvable`
+  else if (S.rolesDir) next.warn = 'pas de rôle : /role'
+  if (JSON.stringify(next) === JSON.stringify(status)) return
+  status = next
+  $.ui.invalidate('ui.render')
+}
+
+// La ligne de la session sous l'invite : rôle, groupe, sessions qui attendent.
+function statusRow($: any, e: any) {
+  const { Box, Text } = $.ui.resolve(e)
+  const items: any[] = []
+  if (status.role) items.push(<Text key="role"><Text dimColor>rôle </Text><Text bold>{status.role}</Text></Text>)
+  if (status.warn) items.push(<Text key="warn" color="warning">⚠ {status.warn}</Text>)
+  if (status.group) items.push(<Text key="group"><Text dimColor>groupe </Text>{status.group}</Text>)
+  if (status.asking) items.push(<Text key="ask" color="warning">⏳ {status.asking} question{status.asking > 1 ? 's' : ''} pour toi</Text>)
+  if (status.done) items.push(<Text key="done" dimColor>✓ {status.done} tour{status.done > 1 ? 's' : ''} fini{status.done > 1 ? 's' : ''} à lire</Text>)
+  if (status.asking || status.done) items.push(<Text key="go" dimColor>/next</Text>)
+  if (!items.length) return null
+  return (
+    <Box key="session" flexDirection="row" gap={2}>
+      {items}
+    </Box>
+  )
 }
 
 async function tick($: any) {
@@ -585,6 +657,18 @@ async function openGroup($: any, group: string) {
   const closed = all.filter(one => !isAlive(one, now))
   if (closed.length) return reopen($, closed)
   return focus($, all[0]!)
+}
+
+// La prochaine session qui t'attend, hors celle-ci : les questions d'abord, puis
+// la plus ancienne. Son onglet passe au premier plan.
+async function nextWaiting($: any): Promise<string> {
+  const now = await $.clock.now()
+  const list = (await waitingList($)).filter(one => one.sid !== S.sid)
+  if (!list.length) return 'Aucune autre session ne t\'attend.'
+  const target = list[0]!
+  const rest = list.length - 1
+  const done = await focus($, target)
+  return `${done} ${stateOf(target, now)}.${rest ? ` Encore ${rest} après elle : /next.` : ''}`
 }
 
 // Ouverte : son onglet passe au premier plan. Fermée ou perdue : rouverte.
@@ -855,12 +939,15 @@ export const register: Register = on => {
     S.transcript = (await $.session.info()).transcriptPath ?? ''
     S.rolesDir = await findRolesDir($)
     S.dirGroup = await findDirGroup($)
+    // La ligne d'état est dessinée (StatusLine) : celle d'une version précédente s'efface.
+    $.ui.status(undefined)
     const args = await launchArgs($)
     S.isOneShot = args.includes('-p') || args.includes('--print')
     await loadIdentity($)
-    S.group = S.group ?? S.dirGroup
+    S.group = S.dirGroup ?? S.group
     await $.command.register({ name: 'moi', description: 'Cette session : nom, rôle, groupe (voir, modifier)' })
     await $.command.register({ name: 'sessions', description: 'Toutes les sessions : chercher, aller à l\'une, rouvrir', argumentHint: '[recherche]' })
+    await $.command.register({ name: 'next', description: 'Aller à la prochaine session qui t\'attend (questions d\'abord, puis la plus ancienne)' })
     await $.command.register({ name: 'role', description: 'Le rôle de cette session : /role <nom>, ou /role pour choisir', argumentHint: '<nom>' })
     await $.command.register({ name: 'group', description: 'Le groupe de cette fenêtre : /group <nom> | open <nom> | close [--force] | - (aucun)', argumentHint: '[<nom> | open <nom> | close | -]' })
     await $.tool.register({
@@ -879,6 +966,19 @@ export const register: Register = on => {
         required: ['to', 'message'],
       },
     })
+    await $.tool.register({
+      name: ROLE_TOOL,
+      isDeferred: false,
+      description: 'Le rôle de cette session (sa fiche .claude/roles/[<groupe>/]<rôle>.md, chargée comme consigne ; la session prend le nom du rôle). '
+        + 'Sans nom : le rôle en place et les fiches disponibles. Avec un nom : prend ce rôle ; changer de rôle demande l\'accord de la personne. '
+        + 'Fiche absente : l\'outil dit où l\'écrire, à rédiger avec la personne avant de rappeler l\'outil.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          nom: { type: 'string', description: 'Nom du rôle à prendre (ex. « ol cto ») ; vide pour voir le rôle en place et les fiches' },
+        },
+      },
+    })
     await tick($)
     $.clock.every(BEAT_MS, () => void tick($).catch(() => undefined))
     return next(e)
@@ -887,6 +987,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     S.doneAt = undefined
     S.askingSince = undefined
+    S.isMailTurn = MAIL_HEAD.test(String((e as any).text ?? ''))
     await refreshFiche($).catch(() => undefined)
     return next(e)
   })
@@ -923,6 +1024,14 @@ export const register: Register = on => {
     }
   })
 
+  on('tool.run', { tool: 'mcp__session__role' as any }, async ($, e: any) => {
+    try {
+      return { result: await takeRole($, String(e.nom ?? '')) }
+    } catch (err: any) {
+      return { deny: err?.message ?? String(err) }
+    }
+  })
+
   on('prompt.context', async ($, e, next) => {
     const out = await next(e)
     await refreshFiche($)
@@ -945,7 +1054,8 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       S.busy = false
       S.askingSince = undefined
-      S.doneAt = e.reason === 'aborted' ? undefined : await $.clock.now()
+      // Un tour ouvert par le courrier d'une autre session a répondu à elle, pas à la personne.
+      S.doneAt = e.reason === 'aborted' || S.isMailTurn ? undefined : await $.clock.now()
       await writeEntry($).catch(() => undefined)
     }
     return out
@@ -958,6 +1068,19 @@ export const register: Register = on => {
     const isShutdown = e.reason === 'other' && (await isStopping($))
     await writeEntry($, isShutdown ? undefined : await $.clock.now()).catch(() => undefined)
     return next(e)
+  })
+
+  on('ui.render', { component: 'StatusLine' }, async ($, e, next) => {
+    const row = statusRow($, e)
+    if (!row) return next(e)
+    const { Box } = $.ui.resolve(e)
+    if (!e.props.text) return row
+    return (
+      <Box flexDirection="column">
+        {await next(e)}
+        {row}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -973,6 +1096,8 @@ export const register: Register = on => {
     if (opened.isPlaced) return { text: 'Fiche de la session ouverte (Échap pour fermer).', isTextDisplayOnly: true }
     return { text: await cardText($) }
   })
+
+  on('command.run', { command: 'next' }, async $ => ({ text: await nextWaiting($), isTextDisplayOnly: true }))
 
   on('command.run', { command: 'sessions' }, async ($, e) => {
     await update($, search, () => e.args.trim())

@@ -8,8 +8,10 @@ The interface text is in French.
 
 - `/moi` shows this session's name, role and group, and lets you change them.
 - `/sessions` lists every session of the machine, open or closed: filter, jump to its tab, or reopen it.
+- `/next` brings forward the next session waiting for you: questions first, then the oldest finished turn.
 - `/role <name>` gives the session a role card and renames the session to it. `/role` alone shows the role in place; with no role, it opens a picker limited to the session's group and the cross-group cards (a button shows every group). A name with no card offers to write the card with the session, from the folder's `_MODELE.md` template, in the group's subfolder.
 - `/group <name>` names the terminal window; every session in it joins the group. `/group open <name>` reopens the closed members of a group, `/group close` closes its tabs (refused while a member is working, unless `--force`), `/group -` leaves the group.
+- A tool for the model, `role`, lets the session take a role itself: the first one with no question, a change of role only with the person's approval; with no card, it says where to write one.
 - A tool for the model, `ecrire`, sends a message to another session by name or role, even a closed one: the message waits in its mailbox and is read as a turn when the session is open and free. It can also reopen the session.
 - The status line shows the role and the group. A session with no role gets a reminder above the prompt. A warning shows when two live sessions hold the same role.
 
@@ -23,7 +25,7 @@ A folder can set the group of the sessions started in it with `.claude/session.j
 { "groupe": "olneia" }
 ```
 
-A session with no group joins it at start; a named terminal window still wins. See [`examples/.claude/roles/`](examples/.claude/roles/).
+The folder's group wins over the terminal window's; a window with no group takes it. See [`examples/.claude/roles/`](examples/.claude/roles/).
 
 The card is sent to the model as an instruction file: present at start, on `--resume` and after `/compact`. Edit it on disk and the new version reaches the session within a few seconds, at its next turn. The role is bound to the session id, not to its name; a fork inherits its parent's role and group.
 
