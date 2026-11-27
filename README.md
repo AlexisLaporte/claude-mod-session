@@ -8,14 +8,22 @@ The interface text is in French.
 
 - `/moi` shows this session's name, role and group, and lets you change them.
 - `/sessions` lists every session of the machine, open or closed: filter, jump to its tab, or reopen it.
-- `/role <name>` gives the session a role card and renames the session to it. `/role` alone opens a picker. A name with no card offers to write the card with the session, from the folder's `_MODELE.md` template.
+- `/role <name>` gives the session a role card and renames the session to it. `/role` alone shows the role in place; with no role, it opens a picker limited to the session's group and the cross-group cards (a button shows every group). A name with no card offers to write the card with the session, from the folder's `_MODELE.md` template, in the group's subfolder.
 - `/group <name>` names the terminal window; every session in it joins the group. `/group open <name>` reopens the closed members of a group, `/group close` closes its tabs (refused while a member is working, unless `--force`), `/group -` leaves the group.
 - A tool for the model, `ecrire`, sends a message to another session by name or role, even a closed one: the message waits in its mailbox and is read as a turn when the session is open and free. It can also reopen the session.
 - The status line shows the role and the group. A session with no role gets a reminder above the prompt. A warning shows when two live sessions hold the same role.
 
 ## Role cards
 
-A role card is a short Markdown file that tells a session who it is, what it owns and what it leaves to others. Cards live in `.claude/roles/<role>.md`, looked up from the session's directory upwards (the nearest folder wins). Files starting with `_` are not roles. See [`examples/.claude/roles/`](examples/.claude/roles/).
+A role card is a short Markdown file that tells a session who it is, what it owns and what it leaves to others. Cards live in `.claude/roles/`, looked up from the session's directory upwards (the nearest folder wins): `<role>.md` at its root for a cross-group card, `<group>/<role>.md` for a card of one group. Files and folders starting with `_` are not roles. Role names stay unique across groups: `/role <name>` takes a card of any group.
+
+A folder can set the group of the sessions started in it with `.claude/session.json`, looked up upwards:
+
+```json
+{ "groupe": "olneia" }
+```
+
+A session with no group joins it at start; a named terminal window still wins. See [`examples/.claude/roles/`](examples/.claude/roles/).
 
 The card is sent to the model as an instruction file: present at start, on `--resume` and after `/compact`. Edit it on disk and the new version reaches the session within a few seconds, at its next turn. The role is bound to the session id, not to its name; a fork inherits its parent's role and group.
 

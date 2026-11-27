@@ -4,10 +4,13 @@ import type { Register } from 'claude-code'
 // Mod « session » : chaque session Claude Code a un nom, un rôle et un groupe,
 // attachés à son identifiant (ils survivent à la reprise et au résumé).
 // - Le nom : celui de /rename, par lequel les autres sessions la trouvent.
-// - Le rôle : sa fiche « .claude/roles/<rôle>.md », cherchée en remontant depuis
+// - Le rôle : sa fiche « .claude/roles/<rôle>.md » (transverse) ou
+//   « .claude/roles/<groupe>/<rôle>.md », le dossier cherché en remontant depuis
 //   son dossier, envoyée comme un fichier d'instructions et renvoyée quand elle
-//   change sur disque.
-// - Le groupe : sa fenêtre, nommée ; un onglet ouvert dedans le rejoint.
+//   change sur disque. /role propose les fiches de son groupe et les transverses.
+// - Le groupe : sa fenêtre, nommée ; un onglet ouvert dedans le rejoint. Un
+//   dossier peut fixer le groupe de ses sessions : « .claude/session.json »,
+//   { "groupe": "<nom>" }, cherché en remontant ; la fenêtre nommée l'emporte.
 // Le terminal n'est connu que par un adaptateur, un exécutable externe
 // (SESSION_TERMINAL, sinon terminals/kitty livré avec le mod) : il dit où tourne
 // la session et sait aller à un onglet, l'ouvrir ou le fermer. Sans lui, le mod
@@ -24,7 +27,9 @@ type Entry = {
   profile: string; transcript: string; term?: Place; at: number; busy: boolean; closedAt?: number
   waiting?: 'question' | 'réponse'; waitingSince?: number
 }
-type Fiche = { name: string; path: string; text: string; mtimeMs: number }
+// group : le sous-dossier de la fiche ; '' pour une fiche transverse (à la racine).
+type Role = { name: string; group: string; path: string }
+type Fiche = Role & { text: string; mtimeMs: number }
 
 const BEAT_MS = 5000
 const TERM_MS = 30000
@@ -34,16 +39,19 @@ const TITLE = /"customTitle":("(?:[^"\\]|\\.)*")/g
 const CARD = 'session'
 const LIST = 'sessions'
 const ROLE_PANE = 'role'
+const DIR_CONFIG = '.claude/session.json'
 const filter = atom({ plugin: 'session', key: 'filter' } as const, '', { shape: 'filter-1' })
 const view = atom({ plugin: 'session', key: 'view' } as const, 'card', { shape: 'view-1' })
 const search = atom({ plugin: 'session', key: 'search' } as const, '', { shape: 'search-1' })
+// Le choix du rôle montre tous les groupes, et non le seul groupe de la session.
+const everyRole = atom({ plugin: 'session', key: 'everyRole' } as const, false, { shape: 'every-role-1' })
 
 // pendingName : le nom à donner par /rename, lancé par la minuterie (d'un
 // hook de commande, /rename attendrait la fin du tour qui le lance).
 // creating : le rôle dont la session rédige la fiche ; pris dès que le fichier existe.
 const S: {
   sid: string; home: string; base: string; cwd: string; profile: string; transcript: string
-  name?: string; role?: string; group?: string; rolesDir: string; fiche: Fiche | null
+  name?: string; role?: string; group?: string; dirGroup?: string; rolesDir: string; fiche: Fiche | null
   term?: Place; termAt: number; busy: boolean; pendingName?: string; creating?: string; isOneShot?: boolean
   askingSince?: number; doneAt?: number
 } = { sid: '', home: '', base: '', cwd: '', profile: '', transcript: '', rolesDir: '', fiche: null, termAt: 0, busy: false }
@@ -114,11 +122,11 @@ async function where($: any): Promise<Place | undefined> {
 
 // ---------- Rôles ----------
 
-// Le dossier des fiches : le premier « .claude/roles » en remontant ; '' sinon.
-async function findRolesDir($: any): Promise<string> {
+// Le premier « rel » en remontant depuis le dossier de la session ; '' sinon.
+async function findUp($: any, rel: string): Promise<string> {
   let dir: string = S.cwd
   while (dir) {
-    const here = `${dir === '/' ? '' : dir}/.claude/roles`
+    const here = `${dir === '/' ? '' : dir}/${rel}`
     if (await $.fs.exists(here)) return here
     if (dir === '/') return ''
     dir = dir.replace(/\/[^/]*$/, '') || '/'
@@ -126,27 +134,75 @@ async function findRolesDir($: any): Promise<string> {
   return ''
 }
 
-// Les rôles disponibles : les fiches du dossier, hors « _MODELE.md » et autres « _… ».
-async function roles($: any): Promise<string[]> {
-  if (!S.rolesDir || !(await $.fs.exists(S.rolesDir))) return []
-  return (await $.fs.list(S.rolesDir))
-    .filter((one: any) => one.kind === 'file' && one.name.endsWith('.md') && !one.name.startsWith('_'))
-    .map((one: any) => one.name.slice(0, -3).normalize('NFC'))
-    .sort((a: string, b: string) => a.localeCompare(b, 'fr'))
+// Le dossier des fiches : le premier « .claude/roles » en remontant ; '' sinon.
+async function findRolesDir($: any): Promise<string> {
+  return findUp($, '.claude/roles')
 }
 
-async function findRole($: any, name: string | undefined): Promise<string | undefined> {
+// Le groupe fixé par le dossier : « groupe » du premier .claude/session.json en remontant.
+async function findDirGroup($: any): Promise<string | undefined> {
+  const path = await findUp($, DIR_CONFIG)
+  if (!path) return undefined
+  const groupe = (await readJson($, path))?.groupe
+  if (typeof groupe !== 'string' || !groupe.trim()) {
+    $.ui.toast(`session : ${path} illisible, il faut { "groupe": "<nom>" }`)
+    return undefined
+  }
+  return groupe.trim()
+}
+
+function isFiche(one: any) {
+  return one.kind === 'file' && one.name.endsWith('.md') && !one.name.startsWith('_')
+}
+
+// Les fiches : à la racine (transverses), et un niveau de sous-dossiers, un par
+// groupe. Les fichiers et dossiers « _… » ne sont pas des rôles.
+async function roles($: any): Promise<Role[]> {
+  if (!S.rolesDir || !(await $.fs.exists(S.rolesDir))) return []
+  const found: Role[] = []
+  for (const one of await $.fs.list(S.rolesDir)) {
+    if (isFiche(one)) found.push({ name: one.name.slice(0, -3).normalize('NFC'), group: '', path: `${S.rolesDir}/${one.name}` })
+    if (one.kind !== 'dir' || one.name.startsWith('_') || one.name.startsWith('.')) continue
+    for (const inner of await $.fs.list(`${S.rolesDir}/${one.name}`)) {
+      if (isFiche(inner)) found.push({ name: inner.name.slice(0, -3).normalize('NFC'), group: one.name.normalize('NFC'), path: `${S.rolesDir}/${one.name}/${inner.name}` })
+    }
+  }
+  return found.sort((a, b) => a.name.localeCompare(b.name, 'fr'))
+}
+
+// Le groupe dont /role montre les fiches : celui de la session, sinon celui du
+// dossier, s'il a un sous-dossier de fiches ; undefined sinon (tout est montré).
+function focusGroup(all: Role[]): string | undefined {
+  for (const wanted of [S.group, S.dirGroup]) {
+    const found = wanted && all.find(one => one.group && key(one.group) === key(wanted))
+    if (found) return found.group
+  }
+  return undefined
+}
+
+// Les fiches du groupe et les transverses ; toutes sans groupe.
+function rolesOf(all: Role[], focus: string | undefined): Role[] {
+  return focus ? all.filter(one => !one.group || one.group === focus) : all
+}
+
+// Un rôle par son nom, dans tous les groupes ; à nom égal, celui du groupe, puis le transverse.
+async function findRole($: any, name: string | undefined): Promise<Role | undefined> {
   if (!name) return undefined
-  return (await roles($)).find(one => key(one) === key(name))
+  const all = await roles($)
+  const focus = focusGroup(all)
+  const same = all.filter(one => key(one.name) === key(name))
+  return same.find(one => focus && one.group === focus) ?? same.find(one => !one.group) ?? same[0]
 }
 
 async function readFiche($: any, name: string | undefined): Promise<Fiche | null> {
   const role = await findRole($, name)
   if (!role) return null
-  const entry = (await $.fs.list(S.rolesDir)).find((one: any) => key(one.name) === key(`${role}.md`))
-  const path = `${S.rolesDir}/${entry.name}`
-  const { mtimeMs } = await $.fs.stat(path)
-  return { name: role, path, text: await $.fs.read(path), mtimeMs }
+  const { mtimeMs } = await $.fs.stat(role.path)
+  return { ...role, text: await $.fs.read(role.path), mtimeMs }
+}
+
+function roleLabel(role: Role) {
+  return role.group ? `${role.name} (groupe ${role.group})` : `${role.name} (transverse)`
 }
 
 function ficheText() {
@@ -158,7 +214,7 @@ function ficheText() {
 async function refreshFiche($: any) {
   if (!S.rolesDir) S.rolesDir = await findRolesDir($)
   if (S.creating && (await findRole($, S.creating))) {
-    const made = (await findRole($, S.creating))!
+    const made = (await findRole($, S.creating))!.name
     S.creating = undefined
     await setRole($, made)
     $.ui.toast(`Fiche « ${made} » créée : rôle pris.`)
@@ -179,11 +235,15 @@ async function setRole($: any, role: string) {
   $.ui.invalidate('prompt.context')
 }
 
-// Fait rédiger la fiche par la session, avec la personne, d'après le gabarit du dossier.
+// Fait rédiger la fiche par la session, avec la personne, d'après le gabarit du
+// dossier : dans le sous-dossier du groupe de la session s'il en a un.
 async function createRole($: any, name: string) {
-  const dir = S.rolesDir || `${await $.session.root()}/.claude/roles`
+  const root = S.rolesDir || `${await $.session.root()}/.claude/roles`
+  const group = focusGroup(await roles($)) ?? S.dirGroup
+  const dir = group ? `${root}/${group}` : root
   S.creating = name
-  const model = (await $.fs.exists(`${dir}/_MODELE.md`)) ? `le gabarit ${dir}/_MODELE.md` : 'un gabarit court (rôle en une phrase, périmètre, hors périmètre, superviseur, gestes qui demandent mon accord direct)'
+  const template = (await $.fs.exists(`${dir}/_MODELE.md`)) ? `${dir}/_MODELE.md` : `${root}/_MODELE.md`
+  const model = (await $.fs.exists(template)) ? `le gabarit ${template}` : 'un gabarit court (rôle en une phrase, périmètre, hors périmètre, superviseur, gestes qui demandent mon accord direct)'
   await $.prompt.submit({
     text: `Rédige avec moi la fiche de rôle « ${name} » de cette session, d'après ${model} et une ou deux fiches voisines de ${dir} s'il y en a. ` +
       `Pose-moi d'abord tes questions (rôle, périmètre, hors périmètre, superviseur, accords), puis montre-moi le texte. ` +
@@ -195,7 +255,7 @@ async function createRole($: any, name: string) {
 async function chooseRole($: any, asked: string): Promise<string> {
   const name = asked.trim()
   if (!name) return ''
-  const role = await findRole($, name)
+  const role = (await findRole($, name))?.name
   if (role) {
     const twin = await twinOf($, role)
     await setRole($, role)
@@ -211,7 +271,18 @@ async function chooseRole($: any, asked: string): Promise<string> {
 async function rolesText($: any) {
   const all = await roles($)
   if (!S.rolesDir) return `Aucun dossier .claude/roles au-dessus de ${S.cwd} : /role <nom> propose d'en créer la fiche.`
-  return all.length ? `Rôles disponibles :\n${all.map(one => `- ${one}`).join('\n')}` : `Aucune fiche dans ${S.rolesDir} : /role <nom> propose d'en créer une.`
+  if (!all.length) return `Aucune fiche dans ${S.rolesDir} : /role <nom> propose d'en créer une.`
+  const focus = focusGroup(all)
+  const mine = rolesOf(all, focus)
+  const others = all.length - mine.length
+  return `Rôles${focus ? ` du groupe « ${focus} » et transverses` : ' disponibles'} :\n${mine.map(one => `- ${roleLabel(one)}`).join('\n')}` +
+    (others ? `\n\n${others} autre(s) dans d'autres groupes : /role <nom> les prend aussi.` : '')
+}
+
+// Le rôle en place, tel que /role le montre quand la session en a un.
+function currentRoleText() {
+  return `Rôle en place : ${roleLabel(S.fiche!)}\nFiche : ${S.fiche!.path}\n` +
+    `Changer : /role <nom>, ou /moi ▸ Rôle.\n\n${S.fiche!.text}`
 }
 
 // ---------- Registre ----------
@@ -379,7 +450,7 @@ async function loadIdentity($: any) {
     S.role = parent?.role
     S.group = S.group ?? parent?.group
   }
-  S.role = S.role ?? (await findRole($, S.name))
+  S.role = S.role ?? (await findRole($, S.name))?.name
 }
 
 // La fenêtre nommée l'emporte ; une session d'un groupe dans une fenêtre sans
@@ -574,6 +645,7 @@ async function closePane($: any, id: string) {
   await $.ui.close({ id })
   await update($, filter, () => '')
   await update($, view, () => 'card')
+  await update($, everyRole, () => false)
 }
 
 async function pickRole($: any, pane: string, name: string) {
@@ -611,28 +683,40 @@ async function pickGroupRow($: any, group: string) {
   $.ui.toast(await openGroup($, group))
 }
 
-// Le choix d'un rôle, dans le panneau /role ou dans /session.
+// Le choix d'un rôle, dans le panneau /role ou dans /moi : les fiches du groupe
+// de la session et les transverses ; « tous les groupes » montre le reste.
 async function rolePicker($: any, e: any, pane: string) {
   const { Box, Text, Input, Button } = $.ui.resolve(e)
   const typed = await read($, filter)
+  const isEvery = await read($, everyRole)
   const all = await roles($)
-  const shown = all.filter(one => key(one).includes(key(typed)))
-  const room = Math.max(1, (e.viewport?.rows ?? 24) - 7)
-  const isNew = typed.trim() && !all.some(one => key(one) === key(typed.trim()))
+  const focus = focusGroup(all)
+  const mine = rolesOf(all, focus)
+  const base = isEvery ? all : mine
+  const shown = base.filter(one => key(one.name).includes(key(typed)))
+  const room = Math.max(1, (e.viewport?.rows ?? 24) - 8)
+  const exact = all.find(one => key(one.name) === key(typed.trim()))
+  const isNew = typed.trim() && !exact
+  const others = all.length - mine.length
   return (
     <Box flexDirection="column">
-      <Text dimColor>{S.fiche ? `Rôle actuel : ${S.fiche.name}` : 'Pas de rôle'}{S.rolesDir ? ` · ${S.rolesDir}` : ' · aucun dossier .claude/roles'}</Text>
+      <Text dimColor>{S.fiche ? `Rôle actuel : ${roleLabel(S.fiche)}` : 'Pas de rôle'}{S.rolesDir ? ` · ${S.rolesDir}` : ' · aucun dossier .claude/roles'}</Text>
       <Input key="role" label="Rôle : " placeholder="filtrer, ou nom d'un nouveau rôle" autoFocus submitLabel={isNew ? 'créer' : 'prendre'}
         value={typed}
         onInput={(value: string) => void update($, filter, () => value)}
-        onSubmit={(value: string) => void pickRole($, pane, shown.length === 1 && !isNew ? shown[0]! : value)} />
+        onSubmit={(value: string) => void pickRole($, pane, exact ? exact.name : shown.length === 1 && !isNew ? shown[0]!.name : value)} />
       {shown.slice(0, room).map(one => (
-        <Button key={`role:${one}`} plain onPress={() => pickRole($, pane, one)}>
-          {one}{S.fiche && key(S.fiche.name) === key(one) ? <Text dimColor> (actuel)</Text> : ''}
+        <Button key={`role:${one.path}`} plain onPress={() => pickRole($, pane, one.name)}>
+          {one.name}<Text dimColor>{one.group ? (isEvery || !focus ? ` · ${one.group}` : '') : ' · transverse'}{S.fiche?.path === one.path ? ' (actuel)' : ''}</Text>
         </Button>
       ))}
       {shown.length > room && <Text dimColor>… {shown.length - room} autres : tape pour filtrer</Text>}
-      {isNew && <Text color="warning">Entrée : créer la fiche « {typed.trim()} »</Text>}
+      {focus && others > 0 && (
+        <Button key="role:every" plain onPress={() => update($, everyRole, () => !isEvery)}>
+          <Text dimColor>{isEvery ? `▸ seulement le groupe « ${focus} »` : `▸ tous les groupes (${others} de plus)`}</Text>
+        </Button>
+      )}
+      {isNew && <Text color="warning">Entrée : créer la fiche « {typed.trim()} »{focus ?? S.dirGroup ? ` dans le groupe « ${focus ?? S.dirGroup} »` : ''}</Text>}
     </Box>
   )
 }
@@ -754,9 +838,11 @@ export const register: Register = on => {
     S.profile = ((await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${S.home}/.claude`).replace(/^.*\/\.claude-?/, '') || 'claude'
     S.transcript = (await $.session.info()).transcriptPath ?? ''
     S.rolesDir = await findRolesDir($)
+    S.dirGroup = await findDirGroup($)
     const args = await launchArgs($)
     S.isOneShot = args.includes('-p') || args.includes('--print')
     await loadIdentity($)
+    S.group = S.group ?? S.dirGroup
     await $.command.register({ name: 'moi', description: 'Cette session : nom, rôle, groupe (voir, modifier)' })
     await $.command.register({ name: 'sessions', description: 'Toutes les sessions : chercher, aller à l\'une, rouvrir', argumentHint: '[recherche]' })
     await $.command.register({ name: 'role', description: 'Le rôle de cette session : /role <nom>, ou /role pour choisir', argumentHint: '<nom>' })
@@ -879,10 +965,12 @@ export const register: Register = on => {
     return { text: await listText($, e.args) }
   })
 
-  // /role seul : le choix en panneau. /role <nom> : ce rôle, ou créer sa fiche.
+  // /role seul : le rôle en place s'il y en a un, sinon le choix en panneau.
+  // /role <nom> : ce rôle, ou créer sa fiche.
   on('command.run', { command: 'role' }, async ($, e) => {
     await refreshFiche($)
     const asked = e.args.trim()
+    if (!asked && S.fiche) return { text: currentRoleText(), isTextDisplayOnly: true }
     if (!asked) {
       const opened = await $.ui.open({ id: ROLE_PANE, title: 'Rôle de cette session', focus: true, closeOnEscape: true })
       if (opened.isPlaced) return { text: 'Choisis ou tape un rôle (Échap pour fermer).', isTextDisplayOnly: true }
@@ -912,12 +1000,13 @@ export const register: Register = on => {
     const found = /^\/(role|group open|group) (.*)$/.exec(before)
     if (!found) return out
     const typed = found[2] ?? ''
-    const options = found[1] === 'role'
-      ? await roles($)
-      : [...new Set((await entries($)).map(one => one.group).filter((one): one is string => !!one))]
+    const all = found[1] === 'role' ? await roles($) : []
+    const options: { name: string; description: string }[] = found[1] === 'role'
+      ? rolesOf(all, focusGroup(all)).map(one => ({ name: one.name, description: one.group ? `rôle · ${one.group}` : 'rôle transverse' }))
+      : [...new Set((await entries($)).map(one => one.group).filter((one): one is string => !!one))].map(name => ({ name, description: 'groupe' }))
     const mine = options
-      .filter(one => key(one).startsWith(key(typed)) && key(one) !== key(typed))
-      .map(one => ({ text: one.slice(typed.length - e.token.length), label: one, description: found[1] === 'role' ? 'rôle' : 'groupe' }))
+      .filter(one => key(one.name).startsWith(key(typed)) && key(one.name) !== key(typed))
+      .map(one => ({ text: one.name.slice(typed.length - e.token.length), label: one.name, description: one.description }))
     return { suggestions: [...out.suggestions, ...mine] }
   })
 
